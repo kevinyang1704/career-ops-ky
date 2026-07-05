@@ -1214,7 +1214,7 @@ try {
     const pipeline = readFileSync(join(fixtureRoot, 'data', 'pipeline.md'), 'utf-8');
     if (
       pipeline.includes('# Pipeline') &&
-      pipeline.includes('## Pending') &&
+      pipeline.includes('## Active Opportunities') &&
       pipeline.includes('- [ ] https://jobs.example.com/1 | Acme | Engineer')
     ) {
       pass('scan.mjs creates data/pipeline.md before appending offers on fresh installs (#1252)');
@@ -1227,6 +1227,61 @@ try {
   }
 } catch (err) {
   fail(`scan.mjs fresh-install pipeline test crashed: ${err.message}`);
+}
+
+try {
+  const { appendToPipeline } = await import(pathToFileURL(join(ROOT, 'scan.mjs')).href);
+  const fixtureRoot = mkdtempSync(join(tmpdir(), 'career-ops-english-pipeline-'));
+  const originalCwd = process.cwd();
+  try {
+    mkdirSync(join(fixtureRoot, 'data'), { recursive: true });
+    writeFileSync(join(fixtureRoot, 'data', 'pipeline.md'), '# Job Search Pipeline\n\n## Pendientes\n\n## Procesadas\n', 'utf-8');
+    process.chdir(fixtureRoot);
+    appendToPipeline([{ url: 'https://jobs.example.com/2', company: 'Acme', title: 'Director' }]);
+    const pipeline = readFileSync(join(fixtureRoot, 'data', 'pipeline.md'), 'utf-8');
+    if (
+      pipeline.includes('## Active Opportunities') &&
+      pipeline.includes('## Processed') &&
+      !pipeline.includes('## Pendientes') &&
+      !pipeline.includes('## Procesadas')
+    ) {
+      pass('scan.mjs normalizes legacy pipeline headings to English before appending');
+    } else {
+      fail(`scan.mjs did not normalize legacy pipeline headings: ${JSON.stringify(pipeline)}`);
+    }
+  } finally {
+    process.chdir(originalCwd);
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+} catch (err) {
+  fail(`scan.mjs English pipeline normalization test crashed: ${err.message}`);
+}
+
+try {
+  const { formatScanReport } = await import(pathToFileURL(join(ROOT, 'scan.mjs')).href);
+  const report = formatScanReport({
+    timestamp: '2026-07-05T12:34:56.000Z',
+    companiesScanned: 2,
+    boardsScanned: 1,
+    handoffs: [{ company: 'Microsoft', method: 'websearch', query: 'site:apply.careers.microsoft.com' }],
+    errors: [{ company: 'Example', kind: 'network', error: 'timeout' }],
+    totals: { found: 10, filteredTitle: 2, filteredTier: 0, filteredLocation: 1, filteredSalary: 0, filteredContent: 0, filteredCooldown: 0, duplicates: 3 },
+    offers: [{ url: 'https://jobs.example.com/3', company: 'Acme', title: 'VP, Data & Analytics', location: 'New York', salary: { min: 240000, max: 320000, currency: 'USD' } }],
+  });
+  if (
+    report.includes('# Scan Report — 2026-07-05') &&
+    report.includes('Companies scanned: 2') &&
+    report.includes('Microsoft') &&
+    report.includes('Example: timeout') &&
+    report.includes('VP, Data & Analytics') &&
+    report.includes('240000-320000 USD')
+  ) {
+    pass('scan.mjs formats a persistent English report with coverage, failures, handoffs, and final offers');
+  } else {
+    fail(`scan.mjs persistent report omitted required outcome data: ${JSON.stringify(report)}`);
+  }
+} catch (err) {
+  fail(`scan.mjs persistent scan report test crashed: ${err.message}`);
 }
 
 const scanMode = fileExists('modes/scan.md') ? readFile('modes/scan.md') : '';
@@ -2566,7 +2621,7 @@ try {
 // ── 11b. TITLE FILTER — acronym word boundaries ──────────────────
 console.log('\n11b. Title filter — acronym word boundaries');
 try {
-  const { buildTitleFilter, compileKeyword } = await import(pathToFileURL(join(ROOT, 'scan.mjs')).href);
+  const { buildTitleFilter, buildCompanyTitlePolicy, compileKeyword } = await import(pathToFileURL(join(ROOT, 'scan.mjs')).href);
 
   // Short all-letter acronyms match on WORD BOUNDARIES, not as substrings.
   const cooFilter = buildTitleFilter({ positive: ['coo'] });
@@ -2610,6 +2665,20 @@ try {
     pass('buildTitleFilter drops whitespace-only keywords instead of matching on spaces');
   } else {
     fail('buildTitleFilter should drop whitespace-only keywords');
+  }
+
+  const companyPolicy = buildCompanyTitlePolicy({
+    positive: ['Director'],
+    bypass_companies: ['Anthropic', 'OpenAI'],
+  });
+  if (
+    companyPolicy('Anthropic', 'Lead Data Scientist, Platform Product') === true &&
+    companyPolicy('Ordinary Co', 'Lead Data Scientist, Platform Product') === false &&
+    companyPolicy('Ordinary Co', 'Director of Product') === true
+  ) {
+    pass('company title policy bypasses the global title gate only for configured companies');
+  } else {
+    fail('company title policy must preserve ordinary title filtering while allowing configured AI labs');
   }
 } catch (e) {
   fail(`title filter acronym tests crashed: ${e.message}`);

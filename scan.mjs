@@ -102,6 +102,15 @@ export function buildTitleFilter(titleFilter) {
   };
 }
 
+export function buildCompanyTitlePolicy(titleFilter) {
+  const filter = buildTitleFilter(titleFilter);
+  const bypassCompanies = new Set(normalizeKeywordList(titleFilter?.bypass_companies));
+  return (company, title) => {
+    const normalizedCompany = typeof company === 'string' ? company.trim().toLowerCase() : '';
+    return bypassCompanies.has(normalizedCompany) || filter(title);
+  };
+}
+
 // ── Location filter ─────────────────────────────────────────────────
 // Optional. If `location_filter` is absent from portals.yml, all locations pass.
 // Semantics (case-insensitive substring, in this order):
@@ -613,15 +622,21 @@ const PIPELINE_SKELETON = `# Pipeline — Pending URLs
 
 Paste job URLs below as \`- [ ] {url}\` then run \`/career-ops pipeline\`.
 
-## Pending
+## Active Opportunities
 
 ## Processed
 `;
 
 // Current section names (English). Legacy Spanish names are checked as fallback
 // so existing pipeline.md files created before this change keep working.
-const PENDING_MARKERS = ['## Pending', '## Pendientes'];
+const PENDING_MARKERS = ['## Active Opportunities', '## Pending', '## Pendientes'];
 const PROCESSED_MARKERS = ['## Processed', '## Procesadas'];
+
+export function normalizePipelineHeadings(text) {
+  return text
+    .replace(/^##\s+(?:Pending|Pendientes)\s*$/gmi, '## Active Opportunities')
+    .replace(/^##\s+Procesadas\s*$/gmi, '## Processed');
+}
 
 export function appendToPipeline(offers) {
   if (offers.length === 0) return;
@@ -631,7 +646,7 @@ export function appendToPipeline(offers) {
     writeFileSync(PIPELINE_PATH, PIPELINE_SKELETON, 'utf-8');
   }
 
-  let text = readFileSync(PIPELINE_PATH, 'utf-8');
+  let text = normalizePipelineHeadings(readFileSync(PIPELINE_PATH, 'utf-8'));
 
   const marker = PENDING_MARKERS.find(m => text.includes(m)) ?? null;
   const idx = marker !== null ? text.indexOf(marker) : -1;
@@ -643,7 +658,7 @@ export function appendToPipeline(offers) {
       return (found === -1 || (i !== -1 && i < found)) ? i : found;
     }, -1);
     const insertAt = procIdx === -1 ? text.length : procIdx;
-    const block = `\n## Pending\n\n` + offers.map(formatPipelineOffer).join('\n') + '\n\n';
+    const block = `\n## Active Opportunities\n\n` + offers.map(formatPipelineOffer).join('\n') + '\n\n';
     text = text.slice(0, insertAt) + block + text.slice(insertAt);
   } else {
     // Find the end of existing Pending content (next ## or end)
@@ -671,6 +686,52 @@ export function appendToScanHistory(offers, date, status = 'added') {
   const lines = offers.map(o => formatScanHistoryRow(o, date, status)).join('\n') + '\n';
 
   appendFileSync(SCAN_HISTORY_PATH, lines, 'utf-8');
+}
+
+export function formatScanReport({ timestamp, companiesScanned = 0, boardsScanned = 0, handoffs = [], errors = [], totals = {}, offers = [] }) {
+  const date = String(timestamp || new Date().toISOString()).slice(0, 10);
+  const lines = [
+    `# Scan Report — ${date}`,
+    '',
+    `- Timestamp: ${timestamp || 'unknown'}`,
+    `- Companies scanned: ${companiesScanned}`,
+    `- Job boards scanned: ${boardsScanned}`,
+    `- Jobs found: ${totals.found || 0}`,
+    `- Added to pipeline: ${offers.length}`,
+    '',
+    '## Filtering',
+    '',
+    `- Title: ${totals.filteredTitle || 0}`,
+    `- Seniority tier: ${totals.filteredTier || 0}`,
+    `- Location: ${totals.filteredLocation || 0}`,
+    `- Salary: ${totals.filteredSalary || 0}`,
+    `- Content: ${totals.filteredContent || 0}`,
+    `- Cooldown: ${totals.filteredCooldown || 0}`,
+    `- Duplicates: ${totals.duplicates || 0}`,
+    '',
+    '## Agent/Web Search Handoffs',
+    '',
+    ...(handoffs.length ? handoffs.map(h => `- ${sanitizeMarkdownField(h.company)} (${sanitizeMarkdownField(h.method)}): ${sanitizeMarkdownField(h.query)}`) : ['- None']),
+    '',
+    '## Failures',
+    '',
+    ...(errors.length ? errors.map(e => `- ${sanitizeMarkdownField(e.company)}: ${sanitizeMarkdownField(e.error)}`) : ['- None']),
+    '',
+    '## Final Discovered Offers',
+    '',
+    ...(offers.length ? offers.map(formatPipelineOffer) : ['- None']),
+    '',
+  ];
+  return lines.join('\n');
+}
+
+export function writeScanReport(summary, reportsDir = 'notes/scans') {
+  mkdirSync(reportsDir, { recursive: true });
+  const timestamp = summary.timestamp || new Date().toISOString();
+  const safeStamp = timestamp.replace(/[:.]/g, '-');
+  const reportPath = path.join(reportsDir, `${safeStamp}-scan.md`);
+  writeFileSync(reportPath, formatScanReport({ ...summary, timestamp }), 'utf-8');
+  return reportPath;
 }
 
 // ── Parallel fetch with concurrency limit ───────────────────────────
@@ -860,7 +921,7 @@ async function main() {
   const config = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
   const companies = Array.isArray(config.tracked_companies) ? config.tracked_companies : [];
   const boards = Array.isArray(config.job_boards) ? config.job_boards : [];
-  const titleFilter = buildTitleFilter(config.title_filter);
+  const titlePolicy = buildCompanyTitlePolicy(config.title_filter);
 
   // Seniority tier classifier integration
   let classifyTier = null;
@@ -993,7 +1054,7 @@ async function main() {
         job.trustFlags = trustResult.flags;
         job.trustLevel = trustResult.level;
 
-        if (!titleFilter(job.title)) {
+        if (!titlePolicy(company.name, job.title)) {
           totalFilteredTitle++;
           continue;
         }
@@ -1129,6 +1190,27 @@ async function main() {
   console.log(`${'━'.repeat(45)}`);
   const summaryCompanies = targets.filter(t => !t._isBoard).length;
   const summaryBoards = targets.filter(t => t._isBoard).length;
+  let scanReportPath = null;
+  if (!dryRun) {
+    scanReportPath = writeScanReport({
+      timestamp: new Date().toISOString(),
+      companiesScanned: summaryCompanies,
+      boardsScanned: summaryBoards,
+      handoffs: agentHandoff,
+      errors,
+      totals: {
+        found: totalFound,
+        filteredTitle: totalFilteredTitle,
+        filteredTier: totalFilteredTier,
+        filteredLocation: totalFilteredLocation,
+        filteredSalary: totalFilteredSalary,
+        filteredContent: totalFilteredContent,
+        filteredCooldown: totalFilteredCooldown,
+        duplicates: totalDupes,
+      },
+      offers: verifiedOffers,
+    });
+  }
   console.log(`Companies scanned:     ${summaryCompanies}`);
   if (summaryBoards > 0) console.log(`Job boards scanned:    ${summaryBoards}`);
   console.log(`Total jobs found:      ${totalFound}`);
@@ -1153,6 +1235,7 @@ async function main() {
     console.log(`Invalid (guarded):     ${invalidOffers.length} dropped`);
   }
   console.log(`New offers added:      ${verifiedOffers.length}`);
+  if (scanReportPath) console.log(`Scan report:           ${scanReportPath}`);
 
   // Trust validation summary (only when trust_filter is configured)
   if (config.trust_filter && config.trust_filter.enabled !== false && verifiedOffers.length > 0) {
